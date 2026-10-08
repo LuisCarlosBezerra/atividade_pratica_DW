@@ -1,0 +1,22 @@
+# Ambiente virtual Python
+.venv/
+venv/
+
+# Cache Python
+__pycache__/
+*.py[cod]
+
+# Dados crus (grandes) - somente o parquet tipado e versionado
+data/raw/
+data/raw_2/
+
+# Volume de dados do Postgres (criado pelo docker)
+dados/
+
+# Scripts auxiliares de desenvolvimento (fora da atividade)
+scripts/benchmark_*.py
+scripts/script_csv_to_parquet.py
+
+# SO / editores
+.DS_Store
+Thumbs.db
