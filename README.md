@@ -19,6 +19,8 @@ entre **2015 e 2021** (710.412 linhas, 51 colunas).
 ├── data/
 │   └── parquet/
 │       └── telemetria_industrial.parquet   # Base pronta (tipada) para carregar
+├── docs/
+│   └── guia_bigquery_parquet_alunos.pdf    # Tutorial da Etapa 2 (BigQuery)
 ├── scripts/
 │   └── script_parquet_to_postgres.py       # Popula o Postgres a partir do Parquet
 └── src/
@@ -112,41 +114,118 @@ Anote o tempo de cada consulta para comparar com o BigQuery.
 
 ## Etapa 2 — BigQuery
 
-### 2.1 Criar o dataset e carregar o Parquet
+> Guia completo em PDF: [`docs/guia_bigquery_parquet_alunos.pdf`](docs/guia_bigquery_parquet_alunos.pdf).
+> O conteúdo abaixo resume esse guia.
 
-Com o `gcloud`/`bq` autenticado (`gcloud auth login`), crie um dataset e carregue
-o arquivo:
+O objetivo é carregar o mesmo Parquet no **Google BigQuery Sandbox** (gratuito,
+sem cartão de crédito) e comparar o tempo de resposta e o volume de dados lidos
+com o PostgreSQL local.
 
-```bash
-bq mk --dataset <PROJETO>:telemetria
-bq load --source_format=PARQUET --replace \
-  <PROJETO>:telemetria.telemetria_industrial \
-  data/parquet/telemetria_industrial.parquet
-```
+### 2.1 Configurar o BigQuery Sandbox
 
-> Pelo **console do BigQuery** também funciona: *Criar tabela → Fonte: Upload →
-> formato Parquet* e aponte para `data/parquet/telemetria_industrial.parquet`.
+- Acesse o console: `console.cloud.google.com/bigquery` com sua conta Google.
+- O Sandbox oferece **10 GB de armazenamento** e **1 TB de consultas/mês** grátis.
+- **Criar projeto**: no seletor de projetos (topo da tela) → *Novo Projeto*
+  (ex.: `telemetria-lab`).
+- **Criar dataset**: no painel *Explorador*, clique nos 3 pontos ao lado do
+  projeto → *Criar conjunto de dados* (ID: `telemetria_ds`, região: `US` ou
+  `southamerica-east1`).
 
-### 2.2 Rodar as mesmas consultas
+### 2.2 Importar o arquivo Parquet
+
+O Parquet tem 89,58 MB — abaixo do limite de 100 MB do navegador — então pode ser
+enviado direto pelo console:
+
+- No painel *Explorador*, 3 pontos ao lado do dataset `telemetria_ds` → *Criar tabela*.
+- *Criar tabela de*: **Upload**.
+- *Selecionar arquivo*: `data/parquet/telemetria_industrial.parquet`.
+- *Formato do arquivo*: **Parquet** (o esquema é detectado automaticamente pelos
+  metadados).
+- *Nome da tabela*: `telemetria_industrial` → *Criar tabela*.
+
+> Alternativa via linha de comando (`bq` autenticado com `gcloud auth login`):
+>
+> ```bash
+> bq mk --dataset <PROJETO>:telemetria_ds
+> bq load --source_format=PARQUET --replace \
+>   <PROJETO>:telemetria_ds.telemetria_industrial \
+>   data/parquet/telemetria_industrial.parquet
+> ```
+
+### 2.3 Cuidados essenciais de sintaxe SQL
+
+O BigQuery usa **Standard SQL**, com pequenas diferenças em relação ao PostgreSQL
+e ao DuckDB:
+
+| Recurso / Operação | PostgreSQL / DuckDB | Google BigQuery |
+|---|---|---|
+| Identificação da tabela | `telemetria_industrial` | `` `projeto.dataset.tabela` `` (com crases) |
+| Truncamento de data | `DATE_TRUNC('day', data)` | `TIMESTAMP_TRUNC(data, DAY)` (sem aspas) |
+| Valores nulos / textos | tratamento via `NULLIF` | `SAFE_CAST(coluna AS FLOAT64)` |
+| Arredondamento | `ROUND(val::numeric, 2)` | `ROUND(val, 2)` |
+
+### 2.4 Medir a performance e desativar o cache
+
+- **Desativar cache**: no editor SQL → *Mais* (Configurações) →
+  *Configurações de consulta* → desmarque **Usar resultados em cache**.
+- **Tempo de execução**: após rodar a consulta, veja a aba *Informações do job*
+  abaixo dos resultados e observe **Tempo decorrido** (*Elapsed time*).
+- **Volume lido**: observe **Bytes processados** (*Bytes processed*) — o BigQuery
+  escaneia apenas alguns MBs, evidenciando a eficiência da leitura colunar
+  (*Data Pruning*).
+
+### 2.5 Consulta SQL de benchmark
+
+Copie e cole a consulta abaixo no editor do BigQuery (substituindo o ID do
+projeto):
 
 ```sql
--- 1) Contagem total
-SELECT count(*) FROM `PROJETO.telemetria.telemetria_industrial`;
-
--- 2) Média anual de alimentação do moinho
-SELECT DATE_TRUNC(data, YEAR) AS ano,
-       AVG(alimentacao_total_do_moinho_t_h) AS media
-FROM `PROJETO.telemetria.telemetria_industrial`
-GROUP BY 1
-ORDER BY 1;
-
--- 3) Potência média do motor do moinho quando a desviadora está ativa
-SELECT AVG(potencia_do_motor_do_moinho_kw)
-FROM `PROJETO.telemetria.telemetria_industrial`
-WHERE desviadora_de_alimentacao_do_moinho_dg01 IS TRUE;
+WITH telemetria_calculada AS (
+    SELECT
+        data,
+        TIMESTAMP_TRUNC(data, DAY) AS dia,
+        -- SAFE_CAST converte para número e transforma textos inválidos em NULL
+        (SAFE_CAST(alimentacao_total_do_moinho_t_h AS FLOAT64) -
+         SAFE_CAST(setpoint_alimentacao_do_moinho_t_h AS FLOAT64)) AS desvio_setpoint,
+        -- Variação (Delta) de vibração (Window Function)
+        SAFE_CAST(vibracao_do_moinho AS FLOAT64) -
+        LAG(SAFE_CAST(vibracao_do_moinho AS FLOAT64), 1) OVER (ORDER BY data) AS delta_vibracao,
+        -- Média móvel de 12 leituras da temperatura de saída
+        AVG(SAFE_CAST(temperatura_de_saida_do_moinho_celsius AS FLOAT64)) OVER (
+            ORDER BY data ROWS BETWEEN 11 PRECEDING AND CURRENT ROW
+        ) AS media_movel_temp_saida,
+        SAFE_CAST(potencia_do_motor_do_moinho_kw AS FLOAT64) AS potencia_motor,
+        SAFE_CAST(temperatura_de_entrada_do_moinho_celsius AS FLOAT64) AS temp_entrada,
+        SAFE_CAST(pressao_diferencial_do_moinho_mpa AS FLOAT64) AS pressao_diferencial,
+        SAFE_CAST(potencia_do_exaustor_principal_kw AS FLOAT64) AS potencia_exaustor,
+        SAFE_CAST(fluxo_de_ar_exaustor_principal_m3_h AS FLOAT64) AS fluxo_ar,
+        SAFE_CAST(silo_argical_percentual AS FLOAT64) AS silo_argical,
+        SAFE_CAST(silo_minerio_ferro_percentual AS FLOAT64) AS silo_minerio
+    FROM `seu-projeto.telemetria_ds.telemetria_industrial`
+)
+SELECT
+    dia,
+    COUNT(*) AS total_amostras_dia,
+    ROUND(AVG(desvio_setpoint), 4) AS media_desvio_setpoint,
+    ROUND(STDDEV(desvio_setpoint), 4) AS std_desvio_setpoint,
+    ROUND(AVG(delta_vibracao), 4) AS media_delta_vibracao,
+    ROUND(MAX(delta_vibracao), 4) AS max_pico_vibracao,
+    ROUND(AVG(media_movel_temp_saida), 2) AS media_temp_saida_filtrada,
+    ROUND(AVG(temp_entrada), 2) AS media_temp_entrada,
+    ROUND(AVG(pressao_diferencial), 4) AS media_pressao_diferencial,
+    ROUND(AVG(potencia_motor), 2) AS media_potencia_moinho,
+    ROUND(AVG(potencia_exaustor), 2) AS media_potencia_exaustor,
+    ROUND(AVG(fluxo_ar), 2) AS media_fluxo_ar,
+    ROUND(AVG(silo_argical), 2) AS media_silo_argical,
+    ROUND(AVG(silo_minerio), 2) AS media_silo_minerio
+FROM telemetria_calculada
+GROUP BY dia
+ORDER BY dia;
 ```
 
-O console do BigQuery mostra o tempo e os **bytes processados** de cada consulta.
+> Observação: o Parquet deste repositório já vem **tipado** (colunas numéricas como
+> `FLOAT64`), então o `SAFE_CAST` é opcional aqui — ele consta no guia como boa
+> prática para bases com dados textuais.
 
 ---
 
